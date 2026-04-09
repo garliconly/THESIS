@@ -1,1 +1,222 @@
+from sklearn.ensemble import GradientBoostingClassifier, GradientBoostingRegressor
+from sklearn.model_selection import StratifiedGroupKFold
+import numpy as np
+import pandas as pd
+import math, random
+from pathlib import Path
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score, average_precision_score, mean_absolute_error, r2_score
+from sklearn.inspection import permutation_importance
+from statsmodels.stats.outliers_influence import variance_inflation_factor
 
+
+STOCKFISH_DATA = "/Users/chessnok/Documents/Stockfish_data.csv"
+OUTPUT_DIR = "/Users/chessnok"
+
+feat_cols = ["g12", "sd5", "kng", "lca", "bmr", "frg", "cb"]
+
+
+def full():
+    random.seed(1)
+    np.random.seed(1)
+
+    df = pd.read_csv(STOCKFISH_DATA, sep=";")
+
+
+
+    for i in range(2, 11):
+        c = f"e{i}"
+        df[c] = pd.to_numeric(df[c], errors="coerce").clip(-300, 300)
+
+    e1 = pd.to_numeric(df["e1"], errors="coerce")
+    df["g12"] = (e1 - pd.to_numeric(df["e2"], errors="coerce")).abs()
+
+    top5 = df[["e1","e2","e3","e4","e5"]].apply(pd.to_numeric, errors="coerce")
+    df["sd5"] = top5.std(axis=1, ddof=0)
+
+    diffs = top5.sub(top5["e1"], axis=0)
+    valid = top5.notna().sum(axis=1)
+    df["bmr"] = (diffs.lt(-100).sum(axis=1) / valid).where(valid > 0, np.nan)
+
+    e1c = e1.clip(-300, 300)
+    d5c = pd.to_numeric(df["bmv_d5_eval_d20"], errors="coerce").clip(-300, 300)
+    df["cb"] = (e1c - d5c).clip(lower=0)
+
+    #adm filter + tok
+    df = df[e1.abs() <= 300].copy().reset_index(drop=True)
+    df["tok"] = ((df["thk"] >= 12) & (df["frc"] >= 0.15)).astype(int)
+
+    # percentile ranking
+    for c in feat_cols + ["frc", "thk"]:
+        df[c + "_r"] = df.groupby("gky")[c].transform(
+            lambda s: pd.to_numeric(s, errors="coerce").rank(method="average", pct=True))
+
+    # composite strategies
+    r_cols = [c + "_r" for c in feat_cols]
+    df["cmp_s"] = df[r_cols].mean(axis=1)
+    df["cpt_s"] = -1.0
+    df["tbc_s"] = -1.0
+    ok = df["tok"] == 1
+    if ok.any():
+        df.loc[ok, "cpt_s"] = df.loc[ok, r_cols + ["frc_r", "thk_r"]].mean(axis=1)
+        df.loc[ok, "tbc_s"] = df.loc[ok, r_cols].mean(axis=1)
+
+
+
+    rng = np.random.default_rng(1)
+    df["rnd_s"] = rng.random(len(df))
+
+    #ml
+    X = df[feat_cols].apply(pd.to_numeric, errors="coerce").fillna(0).values
+    y = df["tok"].values
+    y_reg = np.log1p(df["thk"].values)
+    gids = df["gid"].values
+
+    cv = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=1)
+
+    lrc_oof = np.full(len(df), np.nan)
+    gbc_oof = np.full(len(df), np.nan)
+    gbr_oof = np.full(len(df), np.nan)
+    lrc_aucs, lrc_aps = [], []
+    gbc_aucs, gbc_aps = [], []
+    gbr_maes, gbr_r2s = [], []
+
+
+    for trn, tst in cv.split(X, y, groups=gids):
+        Xtr = X[trn]; Xts = X[tst]
+        ytr = y[trn]; yts = y[tst]
+
+        mdl = LogisticRegression(C=1, penalty="l2", solver="lbfgs",
+            max_iter=2000, class_weight="balanced", random_state=1)
+        mdl.fit(Xtr, ytr)
+        p = mdl.predict_proba(Xts)[:, 1]
+        lrc_oof[tst] = p
+        if len(set(yts)) > 1:
+            lrc_aucs.append(roc_auc_score(yts, p))
+            lrc_aps.append(average_precision_score(yts, p))
+
+        #gbc
+        neg = (ytr == 0).sum(); pos = max((ytr == 1).sum(), 1)
+        sw = np.where(ytr == 1, neg / pos, 1.0)
+        mdl2 = GradientBoostingClassifier(n_estimators=500, learning_rate=0.01,
+            max_depth=3, min_samples_leaf=10, subsample=0.8,
+            loss="log_loss", random_state=1)
+        mdl2.fit(Xtr, ytr, sample_weight=sw)
+        p = mdl2.predict_proba(Xts)[:, 1]
+        gbc_oof[tst] = p
+        if len(set(yts)) > 1:
+            gbc_aucs.append(roc_auc_score(yts, p))
+            gbc_aps.append(average_precision_score(yts, p))
+
+
+
+
+        # gbr
+        mdl3 = GradientBoostingRegressor(n_estimators=500, learning_rate=0.01,
+            max_depth=3, min_samples_leaf=10, subsample=0.8,
+            loss="huber", alpha=0.9, random_state=1)
+        mdl3.fit(Xtr, y_reg[trn])
+        pr = mdl3.predict(Xts)
+        gbr_oof[tst] = pr
+        gbr_maes.append(mean_absolute_error(y_reg[tst], pr))
+        gbr_r2s.append(r2_score(y_reg[tst], pr))
+
+    df["lrc_s"] = lrc_oof
+    df["gbc_s"] = gbc_oof
+    df["gbr_s"] = gbr_oof
+
+    # permutation importance; refit
+    mdl = LogisticRegression(C=1, penalty="l2", solver="lbfgs",
+        max_iter=2000, class_weight="balanced", random_state=1)
+    mdl.fit(X, y)
+    pfi_lrc = permutation_importance(mdl, X, y, n_repeats=10, random_state=1, scoring="roc_auc")
+
+    neg = (y == 0).sum(); pos = max((y == 1).sum(), 1)
+    sw = np.where(y == 1, neg / pos, 1.0)
+    mdl2 = GradientBoostingClassifier(n_estimators=500, learning_rate=0.01,
+        max_depth=3, min_samples_leaf=10, subsample=0.8, random_state=1)
+    mdl2.fit(X, y, sample_weight=sw)
+    pfi_gbc = permutation_importance(mdl2, X, y, n_repeats=10, random_state=1, scoring="roc_auc")
+
+    mdl3 = GradientBoostingRegressor(n_estimators=500, learning_rate=0.01,
+        max_depth=3, min_samples_leaf=10, subsample=0.8,
+        loss="huber", alpha=0.9, random_state=1)
+    mdl3.fit(X, y_reg)
+    pfi_gbr = permutation_importance(mdl3, X, y_reg, n_repeats=10, random_state=1, scoring="neg_mean_absolute_error")
+
+    # selection
+    sels = {"rnd": set(), "rgl": set(df["uid"]), "gap": set(),
+            "cmp": set(), "cpt": set(), "tbc": set(),
+            "lrc": set(), "gbc": set(), "gbr": set()}
+
+    for _, g in df.groupby("gky"):
+        k = max(1, math.ceil(len(g) * 0.10))
+        for strat, col in [("rnd", "rnd_s"), ("gap", "g12"), ("cmp", "cmp_s"),
+                            ("lrc", "lrc_s"), ("gbc", "gbc_s"), ("gbr", "gbr_s")]:
+            sels[strat].update(g.nlargest(k, col)["uid"])
+        h = g[g["tok"] == 1]
+        if len(h) > 0:
+            kt = min(k, len(h))
+            sels["cpt"].update(h.nlargest(kt, "cpt_s")["uid"])
+            sels["tbc"].update(h.nlargest(kt, "tbc_s")["uid"])
+
+    rows = []
+
+    #jaccard
+    nms = list(sels.keys())
+    for i in range(len(nms)):
+        for j in range(i + 1, len(nms)):
+            sa = sels[nms[i]]; sb = sels[nms[j]]
+            inter = len(sa & sb)
+            union = len(sa | sb)
+            mn = min(len(sa), len(sb))
+            rows.append({"typ": "agr", "m1": nms[i], "m2": nms[j],
+                "inter": inter,
+                "jacc": inter / union if union else 0,
+                "ovlp": inter / mn if mn else 0})
+
+
+
+    #summary
+    for nm, uids in sels.items():
+        g = df[df["uid"].isin(uids)]
+        n = len(g)
+        rows.append({"typ": "sum", "met": nm, "n_pos": n, "n_gid": g["gid"].nunique(),
+            "mm_m":  g["mm"].mean() if n else np.nan,
+            "g12_m": g["g12"].mean() if n else np.nan,
+            "sd5_m": g["sd5"].mean() if n else np.nan,
+            "kng_m": g["kng"].mean() if n else np.nan,
+            "lca_m": g["lca"].mean() if n else np.nan,
+            "bmr_m": g["bmr"].mean() if n else np.nan,
+            "frg_m": g["frg"].mean() if n else np.nan,
+            "cb_m":  g["cb"].mean() if n else np.nan,
+            "tok_m": g["tok"].mean() if n else np.nan})
+
+    rows.append({"typ": "mlc", "met": "lrc", "auc": np.mean(lrc_aucs), "ap": np.mean(lrc_aps)})
+    rows.append({"typ": "mlc", "met": "gbc", "auc": np.mean(gbc_aucs), "ap": np.mean(gbc_aps)})
+    rows.append({"typ": "mlr", "met": "gbr", "mae": np.mean(gbr_maes), "r2": np.mean(gbr_r2s)})
+
+    for mname, pfi in [("lrc", pfi_lrc), ("gbc", pfi_gbc), ("gbr", pfi_gbr)]:
+        for fi, feat in enumerate(feat_cols):
+            rows.append({"typ": "imp", "met": mname, "fea": feat,
+                "imp_m": pfi.importances_mean[fi], "imp_s": pfi.importances_std[fi]})
+
+    # Pearson
+    fdf = df[feat_cols].apply(pd.to_numeric, errors="coerce").fillna(0)
+    corr = fdf.corr(method="pearson")
+    for i, f1 in enumerate(feat_cols):
+        for j, f2 in enumerate(feat_cols):
+            if i < j:
+                rows.append({"typ": "cor", "m1": f1, "m2": f2, "val": corr.loc[f1, f2]})
+
+    Xv = fdf.values
+    for i, feat in enumerate(feat_cols):
+        rows.append({"typ": "vif", "fea": feat, "val": variance_inflation_factor(Xv, i)})
+
+    # save
+    pd.DataFrame(rows).to_csv(str(Path(OUTPUT_DIR) / "Results.csv"), index=False)
+    print(f"saved: {Path(OUTPUT_DIR) / 'Results.csv'}")
+
+
+if __name__ == "__main__":
+    full()
