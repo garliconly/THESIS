@@ -1,1 +1,266 @@
+import numpy as np
+import pandas as pd
+import chess, chess.engine
+import os, math, random
+from pathlib import Path
+import networkx as nx
 
+
+CSV_PATH = "/Users/chessnok/Downloads/games.csv"
+ENGINE_PATH = "/Users/chessnok/Downloads/stockfish 3/stockfish-macos-m1-apple-silicon"
+OUTPUT_DIR = "/Users/chessnok"
+
+#tcn decoding (savi2w, MIT license)
+tab = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!?{~}(^)[_]@#$,./&-*++="
+promo_pieces = "qnrbkp"
+engine = None
+
+
+def start_engine():
+    global engine
+    if engine:
+        try: engine.quit()
+        except Exception: pass
+    engine = chess.engine.SimpleEngine.popen_uci(ENGINE_PATH)
+    engine.configure({"Threads": 1})
+
+
+
+
+def run_analysis(board, depth, mpv=1):
+    global engine
+    try:
+        result = engine.analyse(board, chess.engine.Limit(depth=depth), multipv=mpv)
+        return result if isinstance(result, list) else [result]
+    except chess.engine.EngineTerminatedError:
+        start_engine()
+        return []
+    except Exception:
+        return []
+
+
+def decode_tcn(tcn):
+    if len(tcn) % 2 != 0:
+        return []
+    moves = []
+    for i in range(0, len(tcn), 2):
+        o = tab.index(tcn[i])
+        s = tab.index(tcn[i+1])
+        mv = {}
+        if s > 63:
+            mv["pro"] = promo_pieces[(s - 64) // 3]
+            s = o + (-8 if o < 16 else 8) + ((s - 1) % 3) - 1
+        if o > 75:
+            return []  #variant games (if met) are excluded
+        mv["frm"] = tab[o % 8] + str(o // 8 + 1)
+        mv["to"] = tab[s % 8] + str(s // 8 + 1)
+        uci = mv["frm"] + mv["to"]
+        if "pro" in mv:
+            uci += mv["pro"]
+        moves.append(uci)
+    return moves
+
+
+
+def analyse_position(fen):
+    board = chess.Board(fen)
+    infos = run_analysis(board, 20, mpv=10)
+
+
+    moves, scores = [], []
+    for info in infos[:10]:
+        pv = info.get("pv", [])
+        moves.append(pv[0].uci() if pv else None)
+        try: scores.append(info["score"].pov(board.turn).score(mate_score=100000))
+        except (AttributeError, TypeError): scores.append(np.nan)
+    while len(moves) < 10:
+        moves.append(None)
+        scores.append(np.nan)
+
+    #kng
+    sq = board.king(board.turn)
+    attacks = 0
+    if sq:
+        f0, r0 = chess.square_file(sq), chess.square_rank(sq)
+        for df in (-1, 0, 1):
+            for dr in (-1, 0, 1):
+                f, r = f0+df, r0+dr
+                if 0 <= f <= 7 and 0 <= r <= 7:
+                    attacks += len(board.attackers(not board.turn, chess.square(f, r)))
+    checks = sum(1 for m in board.legal_moves if board.gives_check(m))
+    captures = sum(1 for m in board.legal_moves if board.is_capture(m))
+
+    # frg 
+    pieces = board.piece_map()
+    frg = 0.0
+    if len(pieces) > 1:
+        g = nx.DiGraph()
+        for s in pieces: g.add_node(s)
+        for s1 in pieces:
+            for s2 in board.attacks(s1):
+                if s2 in pieces: g.add_edge(s1, s2)
+        if g.number_of_nodes() > 1:
+            bc = nx.betweenness_centrality(g, normalized=True)
+            for s, pc in pieces.items():
+                if board.is_attacked_by(not pc.color, s):
+                    frg += bc.get(s, 0.0)
+
+    return {
+        "fen": fen, "bmv": moves[0],
+        "m2": moves[1], "m3": moves[2], "m4": moves[3], "m5": moves[4],
+        "m6": moves[5], "m7": moves[6], "m8": moves[7], "m9": moves[8], "m10": moves[9],
+        "e1": scores[0], "e2": scores[1], "e3": scores[2], "e4": scores[3], "e5": scores[4],
+        "e6": scores[5], "e7": scores[6], "e8": scores[7], "e9": scores[8], "e10": scores[9],
+        "kng": math.log1p(attacks) + math.log1p(checks),
+        "lca": math.log1p(captures),
+        "frg": frg,
+    }
+
+
+
+
+def full():
+    random.seed(1)
+    np.random.seed(1)
+
+    # reading and filtering
+    cols = ["game_id", "time_control", "white_player_id", "black_player_id",
+            "white_status", "black_status", "white_is_blocked", "black_is_blocked",
+            "tcn_moves", "move_timestamps"]
+
+    df = pd.read_csv(CSV_PATH, usecols=cols, low_memory=False)
+    df = df[df["tcn_moves"].notna() & df["move_timestamps"].notna()].copy()
+    df = df[df["tcn_moves"].astype(str).str.len() > 0].copy()
+    df = df[df["move_timestamps"].astype(str) != "0"].copy()
+
+    bad_status = ["closed", "closed:abuse", "closed:fair_play_violations"]
+    df = df[~df["white_status"].isin(bad_status) & ~df["black_status"].isin(bad_status)].copy()
+    df = df[(df["white_is_blocked"].fillna(0) == 0) & (df["black_is_blocked"].fillna(0) == 0)].copy()
+    df = df.sample(n=300, random_state=1).reset_index(drop=True)
+
+    #  per game per side
+    positions = []
+    for r in df.itertuples(index=False):
+        for color, pid in [("w", r.white_player_id), ("b", r.black_player_id)]:
+            gky = str(r.game_id) + "|" + str(pid)
+            mvs = decode_tcn(str(r.tcn_moves))
+            if not mvs: continue
+
+            raw_ts = str(r.move_timestamps).strip()
+            if not raw_ts or raw_ts == "0": continue
+            ts = [int(x.strip()) for x in raw_ts.split(",") if x.strip()]
+            if len(ts) == len(mvs) + 1: ts = ts[:-1]
+            if len(ts) != len(mvs): continue
+
+            try: base, inc = [float(x) for x in str(r.time_control).split("+")]
+            except ValueError: base, inc = 180.0, 1.0
+
+            clock_w, clock_b = base, base
+            board = chess.Board()
+
+            for i, uci in enumerate(mvs):
+                try: move = chess.Move.from_uci(uci)
+                except ValueError: break
+                if move not in board.legal_moves: break
+
+                after = ts[i] / 10.0
+                repeated = board.is_repetition(2)
+
+                if board.turn == chess.WHITE:
+                    before = clock_w
+                    think = max(before + inc - after, 0.0)
+                    clock_w = after
+                    side = "w"
+                else:
+                    before = clock_b
+                    think = max(before + inc - after, 0.0)
+                    clock_b = after
+                    side = "b"
+
+                if side == color and i + 1 > 18 and not repeated:
+                    positions.append({
+                        "gid": int(r.game_id), "gky": gky, "pid": str(pid),
+                        "ply": i + 1, "fen": board.fen(), "mv": uci,
+                        "clk_b": before, "clk_a": after, "thk": think,
+                        "frc": think / max(before, 1e-9), "rep": 0,
+                    })
+                board.push(move)
+
+    pos_df = pd.DataFrame(positions)
+    pos_df["uid"] = pos_df["gky"] + "|" + pos_df["ply"].astype(str)
+
+    # stockfish deep analysis
+    start_engine()
+    unique_fens = pos_df["fen"].unique().tolist()
+
+    fen_data = []
+    for fen in unique_fens:
+        fen_data.append(analyse_position(fen))
+    pos_df = pos_df.merge(pd.DataFrame(fen_data), on="fen", how="left")
+    pos_df["mm"] = (pos_df["mv"] == pos_df["bmv"]).astype(int)
+
+    # shallow analysis for cb
+    d5_map = {}
+    for fen in unique_fens:
+        board = chess.Board(fen)
+        infos = run_analysis(board, 5, mpv=10)
+        if infos:
+            pv = infos[0].get("pv", [])
+            d5_map[fen] = pv[0].uci() if pv else None
+        else:
+            d5_map[fen] = None
+    pos_df["bmv_d5"] = pos_df["fen"].map(d5_map)
+
+    #eval shallow best move at depth 20
+    move_cols = ["bmv", "m2", "m3", "m4", "m5", "m6", "m7", "m8", "m9", "m10"]
+    eval_cols = ["e1", "e2", "e3", "e4", "e5", "e6", "e7", "e8", "e9", "e10"]
+    pos_df["bmv_d5_eval_d20"] = np.nan
+    for mc, ec in zip(move_cols, eval_cols):
+        mask = (pos_df["bmv_d5"] == pos_df[mc]) & pos_df["bmv_d5_eval_d20"].isna()
+        pos_df.loc[mask, "bmv_d5_eval_d20"] = pd.to_numeric(pos_df.loc[mask, ec], errors="coerce")
+
+    missing = pos_df[pos_df["bmv_d5_eval_d20"].isna() & pos_df["bmv_d5"].notna()]
+    pairs = missing[["fen", "bmv_d5"]].drop_duplicates()
+    if len(pairs) > 0:
+        extra = {}
+        for fen, mv in pairs.itertuples(index=False, name=None):
+            try:
+                bd = chess.Board(fen)
+                m = chess.Move.from_uci(mv)
+                if m in bd.legal_moves:
+                    bd.push(m)
+                    res = run_analysis(bd, 20, mpv=1)
+                    extra[(fen, mv)] = -res[0]["score"].pov(bd.turn).score(mate_score=100000) if res else np.nan
+                else:
+                    extra[(fen, mv)] = np.nan
+            except Exception:
+                extra[(fen, mv)] = np.nan
+        for idx in missing.index:
+            key = (pos_df.at[idx, "fen"], pos_df.at[idx, "bmv_d5"])
+            if key in extra:
+                pos_df.at[idx, "bmv_d5_eval_d20"] = extra[key]
+
+    #features
+    e1 = pd.to_numeric(pos_df["e1"], errors="coerce")
+    pos_df["g12"] = (e1 - pd.to_numeric(pos_df["e2"], errors="coerce")).abs()
+
+    top5 = pos_df[["e1","e2","e3","e4","e5"]].apply(pd.to_numeric, errors="coerce")
+    pos_df["sd5"] = top5.std(axis=1, ddof=0)
+
+    diffs = top5.sub(top5["e1"], axis=0)
+    valid = top5.notna().sum(axis=1)
+    pos_df["bmr"] = (diffs.lt(-100).sum(axis=1) / valid).where(valid > 0, np.nan)
+
+    e1c = e1.clip(-300, 300)
+    d5c = pd.to_numeric(pos_df["bmv_d5_eval_d20"], errors="coerce").clip(-300, 300)
+    pos_df["cb"] = (e1c - d5c).clip(lower=0)
+
+    #save
+    engine.quit()
+    out = Path(OUTPUT_DIR) / "Stockfish_data.csv"
+    pos_df.to_csv(str(out), index=False)
+    print(f"saved: {out} ({pos_df['gid'].nunique()} games, {len(pos_df)} positions)")
+
+
+if __name__ == "__main__":
+    full()
