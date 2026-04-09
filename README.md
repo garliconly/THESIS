@@ -6,7 +6,7 @@ Stockfish.py collects and preprocess data using Stockfish
 
 Analysis.py implements and analyses different strategies and position pools they gather
 
-Datasets of both pipelines will be shared in this branch
+Links for accessing datasets of both pipelines will be shared in a separate branch (Datasets)
 
 Original source dataset:
 Chess.com Titled Tuesday Games (Stassl, 2024)
